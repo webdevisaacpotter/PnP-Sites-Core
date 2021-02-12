@@ -14,6 +14,7 @@ using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json.Linq;
 
 namespace OfficeDevPnP.Core.ALM
 {
@@ -125,6 +126,17 @@ namespace OfficeDevPnP.Core.ALM
             await new SynchronizationContextRemover();
 
             return await BaseAddRequest(bytes, fileInfo.Name, overwrite, timeoutSeconds, scope);
+        }
+
+        /// <summary>
+        /// Requests the request digest from the current site. Use this instead of context.GetRequestDigestAsync() to
+        /// avoid on-prem "Dynamic Operations can only be Performed in Homogenous Appdomain" error.
+        /// </summary>
+        /// <param name="context">The ClientContext object with Site-Collection-Admin-level credentials.</param>
+        /// <returns>The request digest value as a string.</returns>
+        public string GetRequestDigest(ClientContext context)
+        {
+            return Task.Run(() => BaseGetRequestDigest(context)).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -638,6 +650,85 @@ namespace OfficeDevPnP.Core.ALM
         #region Private Methods
 
         /// <summary>
+        /// Requests the request digest from the current session/site
+        /// </summary>
+        /// <param name="context">The current ClientContext with Site-Collection-Admin-Level credentials.</param>
+        /// <returns>The Request Digest as string.</returns>
+        private async Task<string> BaseGetRequestDigest(ClientContext context)
+        {
+            //await new SynchronizationContextRemover();
+            JObject requestDigest = null;
+            string requestDigestString = null;
+
+            using (var handler = new HttpClientHandler())
+            {
+                var accessToken = context.GetAccessToken();
+
+                context.Web.EnsureProperty(w => w.Url);
+
+                if (String.IsNullOrEmpty(accessToken))
+                {
+                    handler.SetAuthenticationCookies(context);
+                }
+
+                using (var httpClient = new PnPHttpProvider(handler))
+                {
+                    string requestUrl = String.Format("{0}/_api/contextinfo", context.Web.Url);
+                    HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, requestUrl);
+                    request.Headers.Add("accept", "application/json;odata=verbose");
+                    if (!string.IsNullOrEmpty(accessToken))
+                    {
+                        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+                    }
+                    else
+                    {
+                        if (context.Credentials is NetworkCredential networkCredential)
+                        {
+                            handler.Credentials = networkCredential;
+                        }
+                    }
+
+                    HttpResponseMessage response = await httpClient.SendAsync(request);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var responseString = await response.Content.ReadAsStringAsync();
+                        if (responseString != null)
+                        {
+                            try
+                            {
+                                var resultCollection = Newtonsoft.Json.JsonConvert.DeserializeObject(responseString);
+                                requestDigest = resultCollection as JObject;
+                                requestDigestString = requestDigest?.First.First.First.First.Value<string>("FormDigestValue");
+                            }
+                            catch { }
+                        }
+                    }
+                    else
+                    {
+                        var errorSb = new System.Text.StringBuilder();
+
+                        errorSb.AppendLine(await response.Content.ReadAsStringAsync());
+                        if (response.Headers.Contains("SPRequestGuid"))
+                        {
+                            var values = response.Headers.GetValues("SPRequestGuid");
+                            if (values != null)
+                            {
+                                var spRequestGuid = values.FirstOrDefault();
+                                errorSb.AppendLine($"ServerErrorTraceCorrelationId: {spRequestGuid}");
+                            }
+                        }
+
+                        throw new Exception(errorSb.ToString());
+                    }
+                }
+
+                return await Task.Run(() => requestDigestString);
+            }
+        }
+
+
+        /// <summary>
         /// Returns an available app
         /// </summary>
         /// <param name="id">The unique id of the app. Notice that this is not the product id as listed in the app catalog.</param>
@@ -681,7 +772,7 @@ namespace OfficeDevPnP.Core.ALM
                             handler.Credentials = networkCredential;
                         }
                     }
-                    request.Headers.Add("X-RequestDigest", await _context.GetRequestDigestAsync());
+                    request.Headers.Add("X-RequestDigest", GetRequestDigest(_context));
 
                     // Perform actual post operation
                     HttpResponseMessage response = await httpClient.SendAsync(request, new System.Threading.CancellationToken());
@@ -773,7 +864,7 @@ namespace OfficeDevPnP.Core.ALM
                             handler.Credentials = networkCredential;
                         }
                     }
-                    request.Headers.Add("X-RequestDigest", await context.GetRequestDigestAsync());
+                    request.Headers.Add("X-RequestDigest", GetRequestDigest(context));
 
                     if (postObject != null)
                     {
@@ -859,7 +950,7 @@ namespace OfficeDevPnP.Core.ALM
                                 handler.Credentials = networkCredential;
                             }
                         }
-                        request.Headers.Add("X-RequestDigest", await context.GetRequestDigestAsync());
+                        request.Headers.Add("X-RequestDigest", GetRequestDigest(context));
 
                         // Perform actual post operation
                         HttpResponseMessage response = await httpClient.SendAsync(request, new System.Threading.CancellationToken());
@@ -917,7 +1008,7 @@ namespace OfficeDevPnP.Core.ALM
 
                     string requestUrl = $"{context.Web.Url}/_api/web/{(scope == AppCatalogScope.Tenant ? "tenant" : "sitecollection")}appcatalog/Add(overwrite={(overwrite.ToString().ToLower())}, url='{filename}')";
 
-                    var requestDigest = await context.GetRequestDigestAsync();
+                    var requestDigest = GetRequestDigest(context);
                     HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, requestUrl);
                     request.Headers.Add("accept", "application/json;odata=nometadata");
                     if (!string.IsNullOrEmpty(accessToken))
